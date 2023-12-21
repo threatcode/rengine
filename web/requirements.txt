@@ -35,5 +35,6 @@ validators==0.18.2
 watchdog==3.0.0
 whatportis
 weasyprint==53.3
-wafw00f==2.2.0
-xmltodict==0.13.0
+wafw00f
+asyncwhois
+fonttools>=4.43.0 # not directly required, pinned by Snyk to avoid a vulnerability
