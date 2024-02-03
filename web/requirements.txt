@@ -38,3 +38,4 @@ weasyprint==53.3
 wafw00f==2.2.0
 xmltodict==0.13.0
 aiohttp>=3.9.0 # not directly required, pinned by Snyk to avoid a vulnerability
+pillow>=10.2.0 # not directly required, pinned by Snyk to avoid a vulnerability
