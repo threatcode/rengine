@@ -10,6 +10,7 @@ import xmltodict
 import yaml
 import tldextract
 import concurrent.futures
+import base64
 
 from datetime import datetime
 from urllib.parse import urlparse
@@ -416,6 +417,7 @@ def subdomain_discovery(
 		proxy = get_random_proxy()
 		if tool in default_subdomain_tools:
 			if tool == 'amass-passive':
+				use_amass_config = config.get(USE_AMASS_CONFIG, False)
 				cmd = f'amass enum -passive -d {host} -o {self.results_dir}/subdomains_amass.txt'
 				cmd += ' -config /root/.config/amass.ini' if use_amass_config else ''
 
@@ -468,14 +470,21 @@ def subdomain_discovery(
 		elif tool in custom_subdomain_tools:
 			tool_query = InstalledExternalTool.objects.filter(name__icontains=tool.lower())
 			if not tool_query.exists():
-				logger.error(f'Missing {{TARGET}} and {{OUTPUT}} placeholders in {tool} configuration. Skipping.')
+				logger.error(f'{tool} configuration does not exists. Skipping.')
 				continue
 			custom_tool = tool_query.first()
 			cmd = custom_tool.subdomain_gathering_command
-			if '{TARGET}' in cmd and '{OUTPUT}' in cmd:
-				cmd = cmd.replace('{TARGET}', host)
-				cmd = cmd.replace('{OUTPUT}', f'{self.results_dir}/subdomains_{tool}.txt')
-				cmd = cmd.replace('{PATH}', custom_tool.github_clone_path) if '{PATH}' in cmd else cmd
+			if '{TARGET}' not in cmd:
+				logger.error(f'Missing {{TARGET}} placeholders in {tool} configuration. Skipping.')
+				continue
+			if '{OUTPUT}' not in cmd:
+				logger.error(f'Missing {{OUTPUT}} placeholders in {tool} configuration. Skipping.')
+				continue
+
+			
+			cmd = cmd.replace('{TARGET}', host)
+			cmd = cmd.replace('{OUTPUT}', f'{self.results_dir}/subdomains_{tool}.txt')
+			cmd = cmd.replace('{PATH}', custom_tool.github_clone_path) if '{PATH}' in cmd else cmd
 		else:
 			logger.warning(
 				f'Subdomain discovery tool "{tool}" is not supported by reNgine. Skipping.')
@@ -1661,49 +1670,75 @@ def dir_file_fuzz(self, ctx={}, description=None):
 				history_file=self.history_file,
 				scan_id=self.scan_id,
 				activity_id=self.activity_id):
+
+			# Empty line, continue to the next record
 			if not isinstance(line, dict):
 				continue
+
+			# Append line to results
 			results.append(line)
-			name = line['input'].get('FUZZ')
+
+			# Retrieve FFUF output
+			url = line['url']
+			# Extract path and convert to base64 (need byte string encode & decode)
+			name = base64.b64encode(extract_path_from_url(url).encode()).decode()
 			length = line['length']
 			status = line['status']
 			words = line['words']
-			url = line['url']
 			lines = line['lines']
 			content_type = line['content-type']
 			duration = line['duration']
+
+			# If name empty log error and continue
 			if not name:
 				logger.error(f'FUZZ not found for "{url}"')
 				continue
+
+			# Get or create endpoint from URL
 			endpoint, created = save_endpoint(url, crawl=False, ctx=ctx)
+
+			# Continue to next line if endpoint returned is None
+			if endpoint == None:
+				continue
+
+			# Save endpoint data from FFUF output
 			endpoint.http_status = status
 			endpoint.content_length = length
 			endpoint.response_time = duration / 1000000000
-			endpoint.save()
-			if created:
-				urls.append(endpoint.http_url)
-			endpoint.status = status
 			endpoint.content_type = content_type
 			endpoint.content_length = length
+			endpoint.save()
+
+			# Save directory file output from FFUF output
 			dfile, created = DirectoryFile.objects.get_or_create(
 				name=name,
 				length=length,
 				words=words,
 				lines=lines,
 				content_type=content_type,
-				url=url)
-			dfile.http_status = status
-			dfile.save()
-			# if created:
-			# 	logger.warning(f'Found new directory or file {url}')
-			dirscan.directory_files.add(dfile)
-			dirscan.save()
+				url=url,
+				http_status=status)
 
+			# Log newly created file or directory if debug activated
+			if created and DEBUG:
+				logger.warning(f'Found new directory or file {url}')
+
+			# Add file to current dirscan
+			dirscan.directory_files.add(dfile)
+
+			# Add subscan relation to dirscan if exists
 			if self.subscan:
 				dirscan.dir_subscan_ids.add(self.subscan)
 
-			subdomain_name = get_subdomain_from_url(endpoint.http_url)
-			subdomain = Subdomain.objects.get(name=subdomain_name, scan_history=self.scan)
+			# Save dirscan datas
+			dirscan.save()
+
+			# Get subdomain and add dirscan
+			if ctx['subdomain_id'] > 0:
+				subdomain = Subdomain.objects.get(id=ctx['subdomain_id'])
+			else:
+				subdomain_name = get_subdomain_from_url(endpoint.http_url)
+				subdomain = Subdomain.objects.get(name=subdomain_name, scan_history=self.scan)
 			subdomain.directories.add(dirscan)
 			subdomain.save()
 
@@ -4056,7 +4091,15 @@ def remove_duplicate_endpoints(
 				logger.warning(msg)
 
 @app.task(name='run_command', bind=False, queue='run_command_queue')
-def run_command(cmd, cwd=None, shell=False, history_file=None, scan_id=None, activity_id=None):
+def run_command(
+		cmd, 
+		cwd=None, 
+		shell=False, 
+		history_file=None, 
+		scan_id=None, 
+		activity_id=None,
+		remove_ansi_sequence=False
+	):
 	"""Run a given command using subprocess module.
 
 	Args:
@@ -4065,7 +4108,7 @@ def run_command(cmd, cwd=None, shell=False, history_file=None, scan_id=None, act
 		echo (bool): Log command.
 		shell (bool): Run within separate shell if True.
 		history_file (str): Write command + output to history file.
-
+		remove_ansi_sequence (bool): Used to remove ANSI escape sequences from output such as color coding
 	Returns:
 		tuple: Tuple with return_code, output.
 	"""
@@ -4104,6 +4147,8 @@ def run_command(cmd, cwd=None, shell=False, history_file=None, scan_id=None, act
 			mode = 'w'
 		with open(history_file, mode) as f:
 			f.write(f'\n{cmd}\n{return_code}\n{output}\n------------------\n')
+	if remove_ansi_sequence:
+		output = remove_ansi_escape_sequences(output)
 	return return_code, output
 
 
